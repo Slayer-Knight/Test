@@ -2,197 +2,131 @@
 
 import asyncio
 import aiohttp
-import csv
 import time
 
 PROXY_LIST_URL = (
-"https://raw.githubusercontent.com/"
-"proxifly/free-proxy-list/main/"
-"proxies/protocols/http/data.txt"
+    "https://raw.githubusercontent.com/"
+    "proxifly/free-proxy-list/main/"
+    "proxies/protocols/http/data.txt"
 )
 
 CONCURRENCY = 300
 TIMEOUT = 5
 
-IP_CHECK_URL = "https://httpbin.org/ip"
-HEADERS_CHECK_URL = "https://httpbin.org/headers"
+TEST_URL = "https://httpbin.org/ip"
 
-OUTPUT_FILE = "trusted_proxies.csv"
+OUTPUT_FILE = "trusted_proxies.txt"
+
 
 async def download_proxy_list():
-print("[+] Downloading proxy list...")
+    print("[+] Downloading proxy list...")
 
-async with aiohttp.ClientSession() as session:
-    async with session.get(PROXY_LIST_URL, timeout=30) as response:
-        response.raise_for_status()
-        text = await response.text()
+    async with aiohttp.ClientSession() as session:
+        async with session.get(PROXY_LIST_URL, timeout=30) as response:
+            response.raise_for_status()
+            text = await response.text()
 
-proxies = [
-    line.strip()
-    for line in text.splitlines()
-    if line.strip()
-]
+    proxies = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
 
-print(f"[+] Loaded {len(proxies)} proxies")
+    print(f"[+] Loaded {len(proxies)} proxies")
 
-return proxies
+    return proxies
+
 
 async def test_proxy(session, semaphore, proxy_url):
+    async with semaphore:
+        try:
+            start = time.perf_counter()
 
-async with semaphore:
+            async with session.get(
+                TEST_URL,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=TIMEOUT),
+            ) as response:
 
-    try:
-        start = time.perf_counter()
+                if response.status != 200:
+                    return None
 
-        async with session.get(
-            IP_CHECK_URL,
-            proxy=proxy_url,
-            timeout=TIMEOUT,
-        ) as response:
+                await response.text()
 
-            if response.status != 200:
-                return None
-
-            await response.text()
-
-        async with session.get(
-            HEADERS_CHECK_URL,
-            proxy=proxy_url,
-            timeout=TIMEOUT,
-        ) as response:
-
-            if response.status != 200:
-                return None
-
-            data = await response.json()
-
-        latency = round(
-            time.perf_counter() - start,
-            2
-        )
-
-        headers = {
-            k.lower(): str(v)
-            for k, v in data.get(
-                "headers", {}
-            ).items()
-        }
-
-        leaked = any(
-            header in headers
-            for header in (
-                "via",
-                "forwarded",
-                "x-forwarded-for",
-                "proxy-connection",
+            latency = round(
+                time.perf_counter() - start,
+                2
             )
-        )
 
-        score = 100
+            return {
+                "proxy": proxy_url,
+                "latency": latency
+            }
 
-        if leaked:
-            score -= 50
+        except Exception:
+            return None
 
-        if latency < 1:
-            score += 25
-        elif latency < 2:
-            score += 15
-        elif latency < 3:
-            score += 10
-
-        return {
-            "proxy": proxy_url,
-            "latency": latency,
-            "leaked_headers": leaked,
-            "score": score,
-        }
-
-    except Exception:
-        return None
 
 async def main():
 
-proxies = await download_proxy_list()
+    proxies = await download_proxy_list()
 
-semaphore = asyncio.Semaphore(CONCURRENCY)
+    semaphore = asyncio.Semaphore(CONCURRENCY)
 
-connector = aiohttp.TCPConnector(
-    limit=CONCURRENCY,
-    ssl=False,
-)
-
-results = []
-
-async with aiohttp.ClientSession(
-    connector=connector
-) as session:
-
-    tasks = [
-        test_proxy(
-            session,
-            semaphore,
-            proxy
-        )
-        for proxy in proxies
-    ]
-
-    completed = 0
-
-    for future in asyncio.as_completed(tasks):
-
-        result = await future
-
-        completed += 1
-
-        if result:
-            results.append(result)
-
-        if completed % 50 == 0:
-
-            print(
-                f"[+] Checked "
-                f"{completed}/{len(proxies)} | "
-                f"Working={len(results)}"
-            )
-
-results.sort(
-    key=lambda x: (
-        x["score"],
-        -x["latency"]
-    ),
-    reverse=True,
-)
-
-with open(
-    OUTPUT_FILE,
-    "w",
-    newline="",
-    encoding="utf-8",
-) as f:
-
-    writer = csv.DictWriter(
-        f,
-        fieldnames=[
-            "proxy",
-            "latency",
-            "leaked_headers",
-            "score",
-        ],
+    connector = aiohttp.TCPConnector(
+        limit=CONCURRENCY,
+        ssl=False
     )
 
-    writer.writeheader()
+    results = []
 
-    writer.writerows(results)
+    async with aiohttp.ClientSession(
+        connector=connector
+    ) as session:
 
-print()
-print(
-    f"[+] Saved "
-    f"{len(results)} working proxies"
-)
-print(
-    f"[+] Output file: "
-    f"{OUTPUT_FILE}"
-)
+        tasks = [
+            test_proxy(
+                session,
+                semaphore,
+                proxy
+            )
+            for proxy in proxies
+        ]
 
-if name == "main":
-asyncio.run(main())
+        completed = 0
+
+        for future in asyncio.as_completed(tasks):
+
+            result = await future
+            completed += 1
+
+            if result:
+                results.append(result)
+
+            if completed % 50 == 0:
+                print(
+                    f"[+] Checked "
+                    f"{completed}/{len(proxies)} | "
+                    f"Working={len(results)}"
+                )
+
+    results.sort(
+        key=lambda x: x["latency"]
+    )
+
+    with open(
+        OUTPUT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        for item in results:
+            f.write(item["proxy"] + "\n")
+
+    print()
+    print(f"[+] Working proxies: {len(results)}")
+    print(f"[+] Saved to: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
